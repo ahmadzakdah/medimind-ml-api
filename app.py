@@ -1,7 +1,8 @@
 import os
+import time
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,Request
 from pydantic import BaseModel
 import joblib
 import pandas as pd
@@ -16,6 +17,13 @@ app = FastAPI(title="MediMind ML API", version="1.0.0")
 def root():
     return {"status": "ok", "service": "medimind-ml-api"}
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    ms = (time.time() - start) * 1000
+    print(f"{request.method} {request.url.path} -> {response.status_code} ({ms:.1f}ms)")
+    return response
 
 # -----------------------------
 # Load artifacts
