@@ -2,7 +2,7 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException,Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import joblib
 import pandas as pd
@@ -10,12 +10,14 @@ import numpy as np
 
 app = FastAPI(title="MediMind ML API", version="1.0.0")
 
+
 # -----------------------------
 # Health check
 # -----------------------------
 @app.get("/")
 def root():
     return {"status": "ok", "service": "medimind-ml-api"}
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -25,18 +27,19 @@ async def log_requests(request: Request, call_next):
     print(f"{request.method} {request.url.path} -> {response.status_code} ({ms:.1f}ms)")
     return response
 
+
 # -----------------------------
 # Load artifacts
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ML model artifacts (for /predict)
-rf_model = joblib.load(os.path.join(BASE_DIR, "rf_model.pkl"))
+# ML model artifacts (calibrated)
+rf_model = joblib.load(os.path.join(BASE_DIR, "rf_model_calibrated.pkl"))
 mlb = joblib.load(os.path.join(BASE_DIR, "mlb.pkl"))
 sym_feature_names = joblib.load(os.path.join(BASE_DIR, "sym_feature_names.pkl"))
 vital_cols = joblib.load(os.path.join(BASE_DIR, "vital_cols.pkl"))
 
-# Suggestion artifacts (for /suggest)
+# Suggestion artifacts
 SUGG_PATH = os.path.join(BASE_DIR, "suggestion_data.pkl")
 if os.path.exists(SUGG_PATH):
     _sugg = joblib.load(SUGG_PATH)
@@ -60,13 +63,15 @@ DEFAULT_VITALS = {
 }
 
 
+# -----------------------------
+# Helper functions
+# -----------------------------
 def _clean_symptom(x) -> str:
     if x is None:
         return ""
     s = str(x).strip().lower()
     if not s or s in {"none", "nan", "null"}:
         return ""
-    # collapse multiple spaces
     while "  " in s:
         s = s.replace("  ", " ")
     return s
@@ -78,7 +83,6 @@ def _normalize_symptoms(symptoms: List[str]) -> List[str]:
         ss = _clean_symptom(s)
         if ss:
             out.append(ss)
-    # unique preserving order
     seen = set()
     uniq = []
     for s in out:
@@ -93,21 +97,17 @@ def _normalize_vitals(vitals: Optional[Dict]) -> Dict[str, float]:
     vit = dict(DEFAULT_VITALS)
     if vitals:
         vit.update(vitals)
-
-    # numeric coercion with fallback
     for k, default in DEFAULT_VITALS.items():
         try:
             vit[k] = float(vit[k])
         except Exception:
             vit[k] = float(default)
-
-    # Gender as 0/1
     vit["Gender"] = 1.0 if vit["Gender"] >= 0.5 else 0.0
     return vit
 
 
 # -----------------------------
-# /predict
+# /predict endpoint
 # -----------------------------
 class PredictRequest(BaseModel):
     symptoms: List[str]
@@ -117,7 +117,6 @@ class PredictRequest(BaseModel):
 @app.post("/predict")
 def predict(data: PredictRequest):
     sym_list = _normalize_symptoms(data.symptoms)
-
     if len(sym_list) < 2:
         raise HTTPException(status_code=400, detail="Need at least 2 symptoms")
 
@@ -131,10 +130,10 @@ def predict(data: PredictRequest):
 
     proba = rf_model.predict_proba(X)[0]
     classes = rf_model.classes_
-    top3 = np.argsort(proba)[::-1][:3]
+    top3_idx = np.argsort(proba)[::-1][:3]
 
     results = []
-    for i in top3:
+    for i in top3_idx:
         results.append({
             "disease": str(classes[i]),
             "probability": round(float(proba[i]) * 100, 2)
@@ -143,11 +142,11 @@ def predict(data: PredictRequest):
 
 
 # -----------------------------
-# /suggest
+# /suggest endpoint
 # -----------------------------
 class DiseaseProb(BaseModel):
     disease: str
-    prob: float  # accepts 0..1 OR 0..100
+    prob: float  # 0..1 or 0..100
 
 
 class SuggestRequest(BaseModel):
@@ -159,15 +158,13 @@ class SuggestRequest(BaseModel):
 @app.post("/suggest")
 def suggest(req: SuggestRequest):
     if not COOCCUR and not SYM_FREQ:
-        # suggestion_data.pkl missing
         raise HTTPException(status_code=500, detail="Suggestion artifacts not found on server")
 
     selected = set(_normalize_symptoms(req.selectedSymptoms))
     limit = max(1, min(int(req.limit or 12), 50))
-
     score: Dict[str, float] = {}
 
-    # (A) Co-occurrence score (weight 0.6)
+    # (A) Co-occurrence score
     for s in selected:
         nxt = COOCCUR.get(s)
         if not nxt:
@@ -177,29 +174,25 @@ def suggest(req: SuggestRequest):
                 continue
             score[cand] = score.get(cand, 0.0) + 0.6 * float(cnt)
 
-    # (B) Disease-driven score (weight 0.4)
+    # (B) Disease-driven score
     if req.topDiseases:
         for dp in req.topDiseases:
             d = (dp.disease or "").strip()
             if not d:
                 continue
             p = float(dp.prob)
-            # accept 0..100 from client (Android currently gets 0..100)
             if p > 1.0:
                 p = p / 100.0
             if p <= 0:
                 continue
-
             dcnt = int(DIS_COUNT.get(d, 0) or 0)
             smap = DIS_SYM.get(d)
             if dcnt <= 0 or not smap:
                 continue
-
             for cand, cnt in smap.items():
                 if cand in selected:
                     continue
                 pSymGivenD = float(cnt) / float(dcnt)
-                # multiply by 100 to roughly match cooccur scale
                 score[cand] = score.get(cand, 0.0) + 0.4 * (p * pSymGivenD * 100.0)
 
     # fallback: popular symptoms
